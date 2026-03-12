@@ -2,8 +2,9 @@
 Job execution logic — the core of what a worker does with a claimed job.
 
 Handles the full execution loop: load checkpoint (if resuming),
-run simulation steps, refresh heartbeats, update progress, write
-periodic checkpoints, and handle completion or failure.
+run simulation steps, check for control signals (pause/cancel),
+refresh heartbeats, update progress, write periodic checkpoints,
+and handle completion or failure.
 """
 
 import uuid
@@ -15,9 +16,11 @@ import redis.asyncio as redis
 from src.config import settings
 from src.core.state_machine import transition_job
 from src.db.repositories import attempt_repo, job_repo
-from src.models.enums import JobStatus, ErrorType
+from src.models.enums import JobStatus
 from src.models.job import Job
+from src.worker.checkpoint import write_checkpoint, load_checkpoint
 from src.worker.heartbeat import refresh_heartbeat, refresh_job_lease
+from src.worker.signal_handler import SignalHandler
 from src.worker.simulation_runner import SimulationRunner
 
 import structlog
@@ -76,9 +79,9 @@ async def execute_job(
     Execute a claimed job through its full simulation lifecycle.
 
     This is the main execution function called by the worker after
-    successfully claiming a job. It runs all simulation steps, handles
-    heartbeats and progress updates, and transitions the job to
-    completed or failed when done.
+    successfully claiming a job. It runs all simulation steps, checks
+    for pause/cancel signals between steps, handles heartbeats and
+    progress updates, and transitions the job to completed or failed.
 
     Args:
         job: The Job ORM object that was claimed.
@@ -92,6 +95,10 @@ async def execute_job(
     job_id = job.id
     log = logger.bind(job_id=str(job_id), worker_id=worker_id)
 
+    # Start listening for control signals (pause/cancel) from the API
+    signal_handler = SignalHandler(redis_client, job_id)
+    await signal_handler.start()
+
     try:
         # Initialize the simulation runner
         runner = SimulationRunner(job.type, job.params)
@@ -100,18 +107,7 @@ async def execute_job(
         starting_step = 0
 
         # If resuming from a checkpoint, load the saved state
-        from src.models.checkpoint import Checkpoint
-        from sqlalchemy import select
-
-        checkpoint_stmt = (
-            select(Checkpoint)
-            .where(Checkpoint.job_id == job_id, Checkpoint.is_valid == True)  # noqa: E712
-            .order_by(Checkpoint.step_number.desc())
-            .limit(1)
-        )
-        result = await session.execute(checkpoint_stmt)
-        checkpoint = result.scalars().first()
-
+        checkpoint = await load_checkpoint(session, job_id)
         if checkpoint:
             state = runner.deserialize_state(checkpoint.data)
             starting_step = checkpoint.step_number + 1
@@ -119,6 +115,24 @@ async def execute_job(
 
         # ── Main execution loop ──────────────────────────────────
         for step in range(starting_step, total_steps):
+
+            # ── Check control signals before each step ───────────
+            if signal_handler.should_cancel:
+                log.info("cancel_signal_processing", step=step)
+                await _handle_cancel(
+                    session, redis_client, job_id, worker_id, attempt_id,
+                    stream_name, message_id,
+                )
+                return
+
+            if signal_handler.should_pause:
+                log.info("pause_signal_processing", step=step)
+                await _handle_pause(
+                    session, job_id, worker_id, attempt_id,
+                    step, runner.serialize_state(state),
+                )
+                return
+
             # Execute one simulation step
             state = await runner.step(step, state)
 
@@ -134,7 +148,7 @@ async def execute_job(
 
             # Periodic checkpoint (every N steps as configured)
             if (step + 1) % settings.checkpoint_interval_steps == 0 and step < total_steps - 1:
-                await _write_checkpoint(
+                await write_checkpoint(
                     session, job_id, attempt_id, step, runner.serialize_state(state)
                 )
 
@@ -155,7 +169,6 @@ async def execute_job(
         )
 
         if updated:
-            # Mark the attempt as completed
             await attempt_repo.finish_attempt(session, attempt_id, status="completed")
 
             # Acknowledge the Redis stream message
@@ -175,7 +188,6 @@ async def execute_job(
         log.error("job_failed", error=error_msg, error_type=error_type)
 
         try:
-            # Transition to failed state
             failed_job = await transition_job(
                 session,
                 job_id,
@@ -186,12 +198,10 @@ async def execute_job(
                 triggered_by="worker",
             )
 
-            # Mark the attempt as failed
             await attempt_repo.finish_attempt(
                 session, attempt_id, status="failed", error_message=error_msg
             )
 
-            # Evaluate retry policy
             if failed_job:
                 await _evaluate_retry(session, failed_job, error_type)
 
@@ -200,6 +210,105 @@ async def execute_job(
         except Exception as inner:
             log.error("failure_handling_error", error=str(inner))
             await session.rollback()
+
+    finally:
+        # Always clean up the signal handler
+        await signal_handler.stop()
+
+
+async def _handle_cancel(
+    session: AsyncSession,
+    redis_client: redis.Redis,
+    job_id: uuid.UUID,
+    worker_id: str,
+    attempt_id: uuid.UUID,
+    stream_name: str | None,
+    message_id: str | None,
+) -> None:
+    """
+    Process a cancel signal — transition to cancelled and clean up.
+
+    Called when the signal handler detects a cancel signal between steps.
+    The job may be in 'running' or 'cancelling' state (API already set
+    it to 'cancelling' before publishing the signal).
+
+    Args:
+        session: Active async database session.
+        redis_client: Active async Redis client.
+        job_id: UUID of the job being cancelled.
+        worker_id: This worker's unique ID.
+        attempt_id: UUID of the current attempt.
+        stream_name: Redis stream for XACK.
+        message_id: Redis message ID for XACK.
+    """
+    updated = await transition_job(
+        session,
+        job_id,
+        JobStatus.CANCELLED,
+        expected_status=[JobStatus.RUNNING, JobStatus.CANCELLING],
+        triggered_by="worker",
+        metadata={"reason": "cancel_signal_received"},
+    )
+
+    if updated:
+        await attempt_repo.finish_attempt(session, attempt_id, status="cancelled")
+
+        if stream_name and message_id:
+            from src.queue.redis_stream import xack_job
+            await xack_job(redis_client, stream_name, message_id)
+
+        await session.commit()
+        logger.info("job_cancelled_by_signal", job_id=str(job_id))
+
+
+async def _handle_pause(
+    session: AsyncSession,
+    job_id: uuid.UUID,
+    worker_id: str,
+    attempt_id: uuid.UUID,
+    current_step: int,
+    serialized_state: dict,
+) -> None:
+    """
+    Process a pause signal — checkpoint state and transition to paused.
+
+    Called when the signal handler detects a pause signal between steps.
+    Writes a checkpoint with the current simulation state so the job
+    can be resumed later from exactly this point.
+
+    Args:
+        session: Active async database session.
+        job_id: UUID of the job being paused.
+        worker_id: This worker's unique ID.
+        attempt_id: UUID of the current attempt.
+        current_step: The last completed step number.
+        serialized_state: Serialized simulation state for the checkpoint.
+    """
+    # Write checkpoint with current state (atomic — invalidates previous)
+    checkpoint_id = await write_checkpoint(
+        session, job_id, attempt_id, current_step, serialized_state,
+    )
+
+    # Transition pausing -> paused (clears worker_id and lease)
+    updated = await transition_job(
+        session,
+        job_id,
+        JobStatus.PAUSED,
+        expected_status=[JobStatus.RUNNING, JobStatus.PAUSING],
+        worker_id=worker_id,
+        triggered_by="worker",
+        metadata={"checkpoint_id": str(checkpoint_id), "paused_at_step": current_step},
+    )
+
+    if updated:
+        await attempt_repo.finish_attempt(session, attempt_id, status="paused")
+        await session.commit()
+        logger.info(
+            "job_paused_by_signal",
+            job_id=str(job_id),
+            step=current_step,
+            checkpoint_id=str(checkpoint_id),
+        )
 
 
 async def _evaluate_retry(
@@ -273,58 +382,3 @@ async def _evaluate_retry(
             error_type=error_type,
             retry_count=job.retry_count,
         )
-
-
-async def _write_checkpoint(
-    session: AsyncSession,
-    job_id: uuid.UUID,
-    attempt_id: uuid.UUID,
-    step_number: int,
-    data: dict,
-) -> uuid.UUID:
-    """
-    Write an atomic checkpoint — invalidate all previous, insert new.
-
-    Within a single flush, marks all prior checkpoints for this job as
-    invalid and inserts the new one as valid. If anything fails, the
-    previous checkpoint remains valid (transaction rollback).
-
-    Args:
-        session: Active async database session.
-        job_id: The job being checkpointed.
-        attempt_id: The current attempt.
-        step_number: The last completed step number.
-        data: Serialized simulation state.
-
-    Returns:
-        UUID of the newly created checkpoint.
-    """
-    from sqlalchemy import update as sa_update
-    from src.models.checkpoint import Checkpoint
-
-    # Invalidate all previous checkpoints for this job
-    invalidate_stmt = (
-        sa_update(Checkpoint)
-        .where(Checkpoint.job_id == job_id, Checkpoint.is_valid == True)  # noqa: E712
-        .values(is_valid=False)
-    )
-    await session.execute(invalidate_stmt)
-
-    # Insert the new valid checkpoint
-    new_checkpoint = Checkpoint(
-        job_id=job_id,
-        attempt_id=attempt_id,
-        step_number=step_number,
-        data=data,
-        is_valid=True,
-    )
-    session.add(new_checkpoint)
-    await session.flush()
-
-    logger.info(
-        "checkpoint_written",
-        job_id=str(job_id),
-        step=step_number,
-        checkpoint_id=str(new_checkpoint.id),
-    )
-    return new_checkpoint.id
