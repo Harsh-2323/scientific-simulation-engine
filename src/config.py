@@ -20,7 +20,7 @@ class Settings(BaseSettings):
 
     # === Database ===
     database_url: str = Field(
-        default="postgresql+asyncpg://postgres:postgres@localhost:5432/simengine",
+        default="postgresql+asyncpg://postgres:postgres@localhost:5433/simengine",
         description="Async SQLAlchemy connection URL for PostgreSQL",
     )
     db_pool_size: int = Field(default=10, description="SQLAlchemy connection pool size")
@@ -85,11 +85,14 @@ class Settings(BaseSettings):
     )
 
     # === LLM ===
-    anthropic_api_key: str = Field(
-        default="", description="Anthropic API key. Set via ANTHROPIC_API_KEY env var."
+    llm_api_key: str = Field(
+        default="", description="LLM provider API key. Set via LLM_API_KEY env var."
+    )
+    llm_base_url: str = Field(
+        default="https://api.groq.com/openai/v1", description="OpenAI-compatible API base URL"
     )
     llm_model: str = Field(
-        default="claude-sonnet-4-20250514", description="Anthropic model for decomposition"
+        default="moonshotai/kimi-k2-instruct", description="Model for DAG decomposition"
     )
     llm_max_tokens: int = Field(default=4096, description="Max tokens for LLM response")
 

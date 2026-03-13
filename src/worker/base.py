@@ -30,6 +30,7 @@ from src.queue.redis_stream import (
     xack_job,
     xreadgroup_job,
 )
+from src.core.circuit_breaker import CircuitBreaker
 from src.worker.executor import execute_job
 from src.worker.heartbeat import refresh_heartbeat, remove_heartbeat
 
@@ -62,6 +63,7 @@ class Worker:
         self._shutting_down = False
         self._running_tasks: dict[uuid.UUID, asyncio.Task] = {}
         self._redis: redis.Redis | None = None
+        self._circuit_breaker: CircuitBreaker | None = None
         self._log = logger.bind(worker_id=self._worker_id)
 
     @property
@@ -88,8 +90,9 @@ class Worker:
         """
         self._log.info("worker_starting")
 
-        # Connect to Redis
+        # Connect to Redis and initialize circuit breaker
         self._redis = redis.from_url(self._config.redis_url, decode_responses=True)
+        self._circuit_breaker = CircuitBreaker(self._redis)
 
         # Register in worker_registry
         async with async_session_factory() as session:
@@ -159,6 +162,25 @@ class Worker:
                     # Another worker already claimed it — ACK and move on
                     await xack_job(self._redis, stream_name, message_id)
                     self._log.debug("claim_lost", job_id=str(job_id))
+                    continue
+
+                # Check circuit breaker for this job type before executing
+                if not await self._circuit_breaker.is_allowed(claimed_job.type):
+                    self._log.warning(
+                        "circuit_breaker_blocked",
+                        job_id=str(job_id),
+                        job_type=claimed_job.type,
+                    )
+                    # Release the job back to queued so another attempt can be made later
+                    await transition_job(
+                        session,
+                        job_id,
+                        JobStatus.QUEUED,
+                        expected_status=JobStatus.RUNNING,
+                        triggered_by="worker",
+                        metadata={"reason": "circuit_breaker_open"},
+                    )
+                    await session.commit()
                     continue
 
                 # Create an attempt row for tracking

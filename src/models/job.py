@@ -13,6 +13,7 @@ from datetime import datetime
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Enum,
     Float,
     ForeignKey,
     Index,
@@ -25,6 +26,22 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base
+
+# PostgreSQL ENUM types — create_type=False because the migration creates them
+_job_status_enum = Enum(
+    'pending', 'queued', 'running', 'completed', 'failed',
+    'cancelling', 'cancelled', 'pausing', 'paused', 'resuming',
+    'retry_scheduled', 'dead_letter',
+    name='job_status', create_type=False,
+)
+_job_priority_enum = Enum(
+    'critical', 'high', 'normal', 'low',
+    name='job_priority', create_type=False,
+)
+_error_type_enum = Enum(
+    'transient', 'permanent',
+    name='error_type', create_type=False,
+)
 
 
 class Job(Base):
@@ -41,8 +58,8 @@ class Job(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     type: Mapped[str] = mapped_column(String(255), nullable=False)
-    status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
-    priority: Mapped[str] = mapped_column(String(50), nullable=False, default="normal")
+    status: Mapped[str] = mapped_column(_job_status_enum, nullable=False, default="pending")
+    priority: Mapped[str] = mapped_column(_job_priority_enum, nullable=False, default="normal")
     params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
@@ -78,7 +95,7 @@ class Job(Base):
 
     # Error tracking
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    error_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    error_type: Mapped[str | None] = mapped_column(_error_type_enum, nullable=True)
 
     # Progress reporting during execution
     progress_percent: Mapped[float] = mapped_column(Float, default=0.0)
@@ -174,8 +191,8 @@ class JobEvent(Base):
         UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False
     )
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
-    old_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    new_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    old_status: Mapped[str | None] = mapped_column(_job_status_enum, nullable=True)
+    new_status: Mapped[str | None] = mapped_column(_job_status_enum, nullable=True)
     triggered_by: Mapped[str] = mapped_column(String(100), nullable=False)
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=datetime.utcnow

@@ -32,9 +32,9 @@ logger = structlog.get_logger(__name__)
 # Defines every legal state transition in the system.
 # If a (from_status, to_status) pair is not in here, it's a bug.
 VALID_TRANSITIONS: dict[str, list[str]] = {
-    "pending":          ["queued"],
+    "pending":          ["queued", "cancelled"],
     "queued":           ["running", "cancelled"],
-    "running":          ["completed", "failed", "cancelling", "pausing"],
+    "running":          ["completed", "failed", "cancelling", "pausing", "queued"],
     "pausing":          ["paused", "failed"],
     "paused":           ["resuming", "cancelled"],
     "resuming":         ["running", "failed"],
@@ -101,7 +101,8 @@ async def transition_job(
         InvalidTransitionError: If the transition is not in VALID_TRANSITIONS.
     """
     # Normalize expected_status to a list for uniform handling
-    if isinstance(expected_status, JobStatus):
+    # Accept both JobStatus enums and plain strings
+    if isinstance(expected_status, (str, JobStatus)):
         expected_statuses = [expected_status]
     else:
         expected_statuses = list(expected_status)
@@ -187,18 +188,27 @@ async def transition_job(
         )
         return None
 
-    # Record the state transition in the audit log
-    old_status = expected_values[0] if len(expected_values) == 1 else expected_values
+    # Record the state transition in the audit log.
+    # Always use the first expected status for old_status — when multiple
+    # expected statuses are passed (e.g., ['pending', 'queued']), we can't
+    # know which one the job was actually in, but the first is representative
+    # and must be a valid enum value for the job_status column.
+    old_status = expected_values[0]
     event = JobEvent(
         job_id=job_id,
         event_type="status_change",
-        old_status=str(old_status) if isinstance(old_status, list) else old_status,
+        old_status=old_status,
         new_status=new_status_value,
         triggered_by=triggered_by,
         timestamp=now,
         metadata_=metadata or {},
     )
     session.add(event)
+    # Flush the event INSERT immediately so the session is clean for
+    # the next operation. Without this, asyncpg can fail with "another
+    # operation is in progress" when multiple transitions run in sequence
+    # on the same session (the pending INSERT collides with the next UPDATE).
+    await session.flush()
 
     logger.info(
         "job_transition",

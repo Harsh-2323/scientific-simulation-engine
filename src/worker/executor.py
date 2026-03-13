@@ -16,8 +16,11 @@ import redis.asyncio as redis
 from src.config import settings
 from src.core.state_machine import transition_job
 from src.db.repositories import attempt_repo, job_repo
+from src.db.session import async_session_factory
 from src.models.enums import JobStatus
 from src.models.job import Job
+from src.core.circuit_breaker import CircuitBreaker
+from src.dag.executor import on_node_completed, on_node_failed
 from src.worker.checkpoint import write_checkpoint, load_checkpoint
 from src.worker.heartbeat import refresh_heartbeat, refresh_job_lease
 from src.worker.signal_handler import SignalHandler
@@ -171,6 +174,10 @@ async def execute_job(
         if updated:
             await attempt_repo.finish_attempt(session, attempt_id, status="completed")
 
+            # Notify circuit breaker of success (closes breaker if half-open)
+            cb = CircuitBreaker(redis_client)
+            await cb.record_success(job.type)
+
             # Acknowledge the Redis stream message
             if stream_name and message_id:
                 from src.queue.redis_stream import xack_job
@@ -178,6 +185,15 @@ async def execute_job(
 
             await session.commit()
             log.info("job_completed", total_steps=total_steps)
+
+            # Notify DAG executor if this job is part of a DAG
+            if job.dag_id:
+                try:
+                    async with async_session_factory() as dag_session:
+                        await on_node_completed(dag_session, redis_client, updated)
+                        await dag_session.commit()
+                except Exception as dag_err:
+                    log.warning("dag_completion_notify_error", error=str(dag_err))
         else:
             log.warning("completion_transition_rejected")
 
@@ -202,8 +218,12 @@ async def execute_job(
                 session, attempt_id, status="failed", error_message=error_msg
             )
 
+            # Notify circuit breaker of failure
+            cb = CircuitBreaker(redis_client)
+            await cb.record_failure(job.type)
+
             if failed_job:
-                await _evaluate_retry(session, failed_job, error_type)
+                await _evaluate_retry(session, failed_job, error_type, redis_client)
 
             await session.commit()
 
@@ -315,6 +335,7 @@ async def _evaluate_retry(
     session: AsyncSession,
     job: Job,
     error_type: str,
+    redis_client: redis.Redis,
 ) -> None:
     """
     Decide whether a failed job should be retried or sent to dead_letter.
@@ -327,6 +348,7 @@ async def _evaluate_retry(
         session: Active async database session.
         job: The failed Job with current retry_count and config.
         error_type: 'transient' or 'permanent'.
+        redis_client: Active async Redis client (for DAG notifications).
     """
     import random
     from datetime import timedelta
@@ -382,3 +404,7 @@ async def _evaluate_retry(
             error_type=error_type,
             retry_count=job.retry_count,
         )
+
+        # Notify DAG executor if this job is part of a DAG
+        if job.dag_id:
+            await on_node_failed(session, redis_client, job)

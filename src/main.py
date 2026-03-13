@@ -14,7 +14,7 @@ import structlog
 from fastapi import FastAPI
 
 from src.api.dependencies import init_redis, close_redis
-from src.api.routes import health, jobs, control
+from src.api.routes import health, jobs, control, metrics, dag
 from src.config import settings
 
 # Map string log level to numeric value for structlog's filtering bound logger
@@ -71,3 +71,5 @@ app = FastAPI(
 app.include_router(health.router, prefix="/api/v1")
 app.include_router(jobs.router, prefix="/api/v1")
 app.include_router(control.router, prefix="/api/v1")
+app.include_router(metrics.router, prefix="/api/v1")
+app.include_router(dag.router, prefix="/api/v1")

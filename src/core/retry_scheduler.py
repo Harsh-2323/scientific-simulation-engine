@@ -15,6 +15,7 @@ import redis.asyncio as redis
 from sqlalchemy import select
 
 from src.config import settings
+from src.core.scheduler import calculate_effective_priority
 from src.core.state_machine import transition_job
 from src.db.session import async_session_factory
 from src.models.enums import JobStatus
@@ -107,13 +108,19 @@ class RetryScheduler:
                 )
 
                 if updated:
-                    # Re-enqueue into Redis
-                    await enqueue_job(self._redis, job.id, job.priority)
+                    # Calculate effective priority with aging applied
+                    effective_priority = calculate_effective_priority(
+                        job.priority, job.queued_at
+                    )
+
+                    # Re-enqueue into Redis at the effective priority level
+                    await enqueue_job(self._redis, job.id, effective_priority)
                     logger.info(
                         "job_re_enqueued",
                         job_id=str(job.id),
                         retry_count=job.retry_count,
-                        priority=job.priority,
+                        base_priority=job.priority,
+                        effective_priority=effective_priority,
                     )
 
             await session.commit()

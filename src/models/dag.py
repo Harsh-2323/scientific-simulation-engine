@@ -10,11 +10,21 @@ parents complete.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base
+
+# PostgreSQL ENUM types — create_type=False because the migration creates them
+_dag_status_enum = Enum(
+    'pending', 'running', 'completed', 'failed', 'cancelled', 'partially_failed',
+    name='dag_status', create_type=False,
+)
+_dag_failure_policy_enum = Enum(
+    'fail_fast', 'skip_downstream', 'retry_node',
+    name='dag_failure_policy', create_type=False,
+)
 
 
 class DagGraph(Base):
@@ -33,7 +43,7 @@ class DagGraph(Base):
     )
     name: Mapped[str] = mapped_column(String(512), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
+    status: Mapped[str] = mapped_column(_dag_status_enum, nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )
@@ -50,7 +60,7 @@ class DagGraph(Base):
 
     # How to handle node failures within this DAG
     failure_policy: Mapped[str] = mapped_column(
-        String(50), nullable=False, default="skip_downstream"
+        _dag_failure_policy_enum, nullable=False, default="skip_downstream"
     )
 
     # Arbitrary metadata for extensibility
