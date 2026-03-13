@@ -6,6 +6,7 @@ of simulation sub-jobs. The LLM output is parsed, validated against
 the DAG schema, and optionally created in the database.
 """
 
+import asyncio
 import json
 import re
 import time
@@ -143,14 +144,19 @@ async def decompose_instruction(
 
     try:
         client = AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
-        response = await client.chat.completions.create(
-            model=model,
-            max_tokens=settings.llm_max_tokens,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": instruction},
-            ],
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model,
+                max_tokens=settings.llm_max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": instruction},
+                ],
+            ),
+            timeout=settings.llm_timeout_seconds,
         )
+    except asyncio.TimeoutError:
+        raise LLMError(f"LLM request timed out after {settings.llm_timeout_seconds}s")
     except Exception as e:
         raise LLMError(f"OpenAI API error: {e}")
 

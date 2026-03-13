@@ -58,12 +58,22 @@ async def write_checkpoint(
     import json
     from src.core.exceptions import CheckpointError
 
+    from src.config import settings
+
     # Validate the data can round-trip through JSON serialization
     try:
         serialized = json.dumps(data)
         json.loads(serialized)
     except (TypeError, ValueError) as e:
         raise CheckpointError(f"Checkpoint data is not JSON-serializable: {e}")
+
+    # Guard against oversized checkpoints bloating the DB
+    max_bytes = int(settings.max_checkpoint_bytes)
+    if len(serialized.encode("utf-8")) > max_bytes:
+        raise CheckpointError(
+            f"Checkpoint data exceeds max size of {max_bytes} bytes "
+            f"({len(serialized.encode('utf-8'))} bytes)"
+        )
 
     # Step 1: Invalidate all previous checkpoints for this job
     invalidate_stmt = (

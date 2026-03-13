@@ -95,6 +95,7 @@ class Settings(BaseSettings):
         default="moonshotai/kimi-k2-instruct", description="Model for DAG decomposition"
     )
     llm_max_tokens: int = Field(default=4096, description="Max tokens for LLM response")
+    llm_timeout_seconds: float = Field(default=30.0, description="Timeout for LLM API calls in seconds")
 
     # === DAG ===
     max_dag_nodes: int = Field(default=50, description="Maximum nodes per DAG")
@@ -111,6 +112,9 @@ class Settings(BaseSettings):
     )
     checkpoint_interval_steps: int = Field(
         default=10, description="Checkpoint every N steps"
+    )
+    max_checkpoint_bytes: int = Field(
+        default=10_485_760, description="Max checkpoint size in bytes (default 10MB)"
     )
 
     # === Logging ===
