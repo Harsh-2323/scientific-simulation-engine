@@ -183,12 +183,13 @@ class Worker:
                     await session.commit()
                     continue
 
-                # Create an attempt row for tracking
+                # Create an attempt row — use actual count to handle pause/resume
+                existing_attempts = await attempt_repo.get_attempts_for_job(session, job_id)
                 attempt = await attempt_repo.create_attempt(
                     session,
                     job_id=job_id,
                     worker_id=self._worker_id,
-                    attempt_number=claimed_job.retry_count + 1,
+                    attempt_number=len(existing_attempts) + 1,
                 )
 
                 # Update worker_registry to show we're busy

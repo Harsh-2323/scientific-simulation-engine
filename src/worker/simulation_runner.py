@@ -28,8 +28,8 @@ def _run_cfd_step(step_number: int, reynolds_number: float, mesh_resolution: int
     Numerically integrates a simplified Navier-Stokes residual using
     finite difference approximation on a 1D grid.
     """
-    grid_size = min(mesh_resolution // 100, 200)  # cap for performance
-    dx = 1.0 / max(grid_size, 1)
+    grid_size = max(min(mesh_resolution // 100, 200), 3)  # cap for performance, min 3
+    dx = 1.0 / grid_size
     dt = 0.001 / max(reynolds_number / 1e6, 0.1)
 
     # Restore or initialize velocity field
@@ -108,8 +108,8 @@ def _run_thermal_step(step_number: int, temperature: float, mesh_resolution: int
     Simulate one thermal/heat transfer step.
     Uses explicit finite difference to solve 1D heat equation.
     """
-    grid_size = min(mesh_resolution // 100, 150)
-    dx = 1.0 / max(grid_size, 1)
+    grid_size = max(min(mesh_resolution // 100, 150), 3)
+    dx = 1.0 / grid_size
     alpha = 1e-4  # thermal diffusivity
     dt = 0.4 * dx ** 2 / alpha  # stability condition
 

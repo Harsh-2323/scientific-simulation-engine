@@ -12,6 +12,7 @@ import logging
 
 import structlog
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.dependencies import init_redis, close_redis
 from src.api.routes import health, jobs, control, metrics, dag
@@ -65,6 +66,13 @@ app = FastAPI(
     ),
     version="0.1.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Include route modules under the /api/v1 prefix

@@ -7,6 +7,7 @@ refresh heartbeats, update progress, write periodic checkpoints,
 and handle completion or failure.
 """
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 
@@ -139,6 +140,11 @@ async def execute_job(
             # Execute one simulation step
             state = await runner.step(step, state)
 
+            # Optional pacing — lets pause/cancel signals be processed between steps
+            step_duration = float(job.params.get("step_duration_seconds", 0))
+            if step_duration > 0:
+                await asyncio.sleep(step_duration)
+
             # Refresh heartbeat in Redis and extend lease in Postgres
             await refresh_heartbeat(redis_client, worker_id)
             await refresh_job_lease(session, job_id)
@@ -261,11 +267,21 @@ async def _handle_cancel(
         stream_name: Redis stream for XACK.
         message_id: Redis message ID for XACK.
     """
+    # If still RUNNING (API signal arrived but DB not yet updated), go through CANCELLING first
+    from src.db.repositories import job_repo as _job_repo
+    current_job = await _job_repo.get_job_by_id(session, job_id)
+    if current_job and current_job.status == "running":
+        await transition_job(
+            session, job_id, JobStatus.CANCELLING,
+            expected_status=JobStatus.RUNNING,
+            triggered_by="worker",
+        )
+
     updated = await transition_job(
         session,
         job_id,
         JobStatus.CANCELLED,
-        expected_status=[JobStatus.RUNNING, JobStatus.CANCELLING],
+        expected_status=JobStatus.CANCELLING,
         triggered_by="worker",
         metadata={"reason": "cancel_signal_received"},
     )
@@ -309,12 +325,22 @@ async def _handle_pause(
         session, job_id, attempt_id, current_step, serialized_state,
     )
 
+    # If still RUNNING (API signal arrived but DB not yet updated), go through PAUSING first
+    from src.db.repositories import job_repo as _job_repo
+    current_job = await _job_repo.get_job_by_id(session, job_id)
+    if current_job and current_job.status == "running":
+        await transition_job(
+            session, job_id, JobStatus.PAUSING,
+            expected_status=JobStatus.RUNNING,
+            triggered_by="worker",
+        )
+
     # Transition pausing -> paused (clears worker_id and lease)
     updated = await transition_job(
         session,
         job_id,
         JobStatus.PAUSED,
-        expected_status=[JobStatus.RUNNING, JobStatus.PAUSING],
+        expected_status=JobStatus.PAUSING,
         worker_id=worker_id,
         triggered_by="worker",
         metadata={"checkpoint_id": str(checkpoint_id), "paused_at_step": current_step},
